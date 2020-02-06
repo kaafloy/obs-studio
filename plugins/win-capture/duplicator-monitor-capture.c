@@ -1,9 +1,11 @@
 #include <windows.h>
+#include <winuser.h>
 
 #include <obs-module.h>
 #include <util/dstr.h>
 
 #include "cursor-capture.h"
+#include "window-helpers.h"
 
 #define do_log(level, format, ...)                                \
 	blog(level, "[duplicator-monitor-capture: '%s'] " format, \
@@ -17,6 +19,7 @@
 
 #define TEXT_MONITOR_CAPTURE obs_module_text("MonitorCapture")
 #define TEXT_CAPTURE_CURSOR  obs_module_text("CaptureCursor")
+#define TEXT_CAPTURE_FOREGROUND_WINDOW obs_module_text("CaptureForegroundWindow")
 #define TEXT_COMPATIBILITY   obs_module_text("Compatibility")
 #define TEXT_MONITOR         obs_module_text("Monitor")
 #define TEXT_PRIMARY_MONITOR obs_module_text("PrimaryMonitor")
@@ -25,17 +28,26 @@
 
 #define RESET_INTERVAL_SEC 3.0f
 
+struct region {
+	long x;
+	long y;
+	uint32_t width;
+	uint32_t height;
+} typedef region_t;
+
 struct duplicator_capture {
 	obs_source_t *source;
 	int monitor;
+	int rot;
+
 	bool capture_cursor;
+	bool capture_foreground_window;
 	bool showing;
 
-	long x;
-	long y;
-	int rot;
-	uint32_t width;
-	uint32_t height;
+	region_t capture;
+	region_t target;
+	region_t display;
+
 	gs_duplicator_t *duplicator;
 	float reset_timeout;
 	struct cursor_data cursor_data;
@@ -48,15 +60,16 @@ static inline void update_settings(struct duplicator_capture *capture,
 {
 	capture->monitor = (int)obs_data_get_int(settings, "monitor");
 	capture->capture_cursor = obs_data_get_bool(settings, "capture_cursor");
+	capture->capture_foreground_window =
+		obs_data_get_bool(settings, "capture_foreground_window");
 
 	obs_enter_graphics();
 
 	gs_duplicator_destroy(capture->duplicator);
 	capture->duplicator = NULL;
-	capture->width = 0;
-	capture->height = 0;
-	capture->x = 0;
-	capture->y = 0;
+	memset(&capture->capture, 0, sizeof(region_t));
+	memset(&capture->target, 0, sizeof(region_t));
+	memset(&capture->display, 0, sizeof(region_t));
 	capture->rot = 0;
 	capture->reset_timeout = RESET_INTERVAL_SEC;
 
@@ -89,6 +102,7 @@ static void duplicator_capture_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "monitor", 0);
 	obs_data_set_default_bool(settings, "capture_cursor", true);
+	obs_data_set_default_bool(settings, "capture_focusedwindow", false);
 }
 
 static void duplicator_capture_update(void *data, obs_data_t *settings)
@@ -116,10 +130,13 @@ static void reset_capture_data(struct duplicator_capture *capture)
 	gs_texture_t *texture = gs_duplicator_get_texture(capture->duplicator);
 
 	gs_get_duplicator_monitor_info(capture->monitor, &monitor_info);
-	capture->width = gs_texture_get_width(texture);
-	capture->height = gs_texture_get_height(texture);
-	capture->x = monitor_info.x;
-	capture->y = monitor_info.y;
+	capture->display.width = capture->capture.width =
+		gs_texture_get_width(texture);
+	capture->display.height = capture->capture.height =
+		gs_texture_get_height(texture);
+	capture->display.x = capture->capture.x = monitor_info.x;
+	capture->display.y = capture->capture.y = monitor_info.y;
+
 	capture->rot = monitor_info.rotation_degrees;
 }
 
@@ -128,17 +145,116 @@ static void free_capture_data(struct duplicator_capture *capture)
 	gs_duplicator_destroy(capture->duplicator);
 	cursor_data_free(&capture->cursor_data);
 	capture->duplicator = NULL;
-	capture->width = 0;
-	capture->height = 0;
-	capture->x = 0;
-	capture->y = 0;
+	memset(&capture->capture, 0, sizeof(region_t));
+	memset(&capture->target, 0, sizeof(region_t));
+	memset(&capture->display, 0, sizeof(region_t));
 	capture->rot = 0;
 	capture->reset_timeout = 0.0f;
+}
+
+static bool is_valid_window(struct duplicator_capture *capture, HWND hwnd)
+{
+	struct dstr name = {0};
+
+	POINT monitor_topleft = {capture->display.x, capture->display.y};
+	HMONITOR monitor_capture =
+		MonitorFromPoint(monitor_topleft, MONITOR_DEFAULTTONEAREST);
+	HMONITOR monitor_window =
+		MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	if (monitor_capture != monitor_window)
+		return false;
+
+	if (get_window_exe(&name, hwnd)) {
+		if (dstr_find_i(&name, "explorer.exe")) {
+			//return false;
+		}
+
+		//blog(LOG_INFO, "%s", name.array);
+		dstr_free(&name);
+	}
+
+	LONG style = GetWindowLong(hwnd, GWL_STYLE);
+	if (style &= WS_CAPTION)
+		return true;
+
+	return false;
+}
+
+static inline float lerp(float a, float b, float x)
+{
+	a *= 100;
+	b *= 100;
+	return ((1.0f - x) * a + x * b) / 100.0f;
 }
 
 static void duplicator_capture_tick(void *data, float seconds)
 {
 	struct duplicator_capture *capture = data;
+
+	if (capture->capture_foreground_window) {
+		HWND hwnd = GetForegroundWindow();
+		while (true) {
+			HWND parent = GetParent(hwnd);
+			if (parent == NULL)
+				break;
+			hwnd = parent;
+		}
+
+		if (!is_valid_window(capture, hwnd)) {
+			capture->target.x = capture->display.x;
+			capture->target.y = capture->display.y;
+			capture->target.width = capture->display.width;
+			capture->target.height = capture->display.height;
+		} else {
+			RECT rect;
+			GetClientRect(hwnd, &rect);
+
+			POINT topLeft;
+			topLeft.x = rect.left;
+			topLeft.y = rect.top;
+
+			POINT bottomRight;
+			bottomRight.x = rect.right;
+			bottomRight.y = rect.bottom;
+
+			ClientToScreen(hwnd, &topLeft);
+			ClientToScreen(hwnd, &bottomRight);
+
+			long x = topLeft.x;
+			long y = topLeft.y;
+			uint32_t width = bottomRight.x - topLeft.x;
+			uint32_t height = bottomRight.y - topLeft.y;
+
+			if (capture->target.x != x || capture->target.y != y ||
+			    capture->target.width != width ||
+			    capture->target.height != height) {
+
+				capture->target.x = x;
+				capture->target.y = y;
+				capture->target.width = width;
+				capture->target.height = height;
+
+				info("%i, %i (%i x %i)", capture->target.x,
+				     capture->target.y, capture->target.width,
+				     capture->target.height);
+			}
+		}
+
+		if (capture->capture.x != capture->target.x ||
+		    capture->capture.y != capture->target.y ||
+		    capture->capture.width != capture->target.width ||
+		    capture->capture.height != capture->target.height) {
+			const float factor = seconds * 30.0f;
+			capture->capture.x = (long)round(lerp(
+				capture->target.x, capture->capture.x, factor));
+			capture->capture.y = (long)round(lerp(
+				capture->target.y, capture->capture.y, factor));
+			capture->capture.width = (long)round(lerp(capture->target.width,
+					   capture->capture.width, factor));
+			capture->capture.height =(long)round(lerp(capture->target.height,
+					   capture->capture.height, factor));
+		}
+	}
 
 	/* completely shut down monitor capture if not in use, otherwise it can
 	 * sometimes generate system lag when a game is in fullscreen mode */
@@ -177,8 +293,7 @@ static void duplicator_capture_tick(void *data, float seconds)
 
 		if (!gs_duplicator_update_frame(capture->duplicator)) {
 			free_capture_data(capture);
-
-		} else if (capture->width == 0) {
+		} else if (capture->capture.width == 0) {
 			reset_capture_data(capture);
 		}
 	}
@@ -194,26 +309,32 @@ static void duplicator_capture_tick(void *data, float seconds)
 static uint32_t duplicator_capture_width(void *data)
 {
 	struct duplicator_capture *capture = data;
-	return capture->rot % 180 == 0 ? capture->width : capture->height;
+	return capture->rot % 180 == 0 ? capture->capture.width
+				       : capture->capture.height;
 }
 
 static uint32_t duplicator_capture_height(void *data)
 {
 	struct duplicator_capture *capture = data;
-	return capture->rot % 180 == 0 ? capture->height : capture->width;
+	return capture->rot % 180 == 0 ? capture->capture.height
+				       : capture->capture.width;
 }
 
 static void draw_cursor(struct duplicator_capture *capture)
 {
-	cursor_draw(&capture->cursor_data, -capture->x, -capture->y, 1.0f, 1.0f,
-		    capture->rot % 180 == 0 ? capture->width : capture->height,
-		    capture->rot % 180 == 0 ? capture->height : capture->width);
+	cursor_draw(&capture->cursor_data, -capture->capture.x,
+		    -capture->capture.y, 1.0f, 1.0f,
+		    capture->rot % 180 == 0 ? capture->capture.width
+					    : capture->capture.height,
+		    capture->rot % 180 == 0 ? capture->capture.height
+					    : capture->capture.width);
 }
 
 static void duplicator_capture_render(void *data, gs_effect_t *effect)
 {
 	struct duplicator_capture *capture = data;
 	gs_texture_t *texture;
+	gs_eparam_t *image;
 	int rot;
 
 	if (!capture->duplicator)
@@ -225,35 +346,41 @@ static void duplicator_capture_render(void *data, gs_effect_t *effect)
 
 	effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 
+	image = gs_effect_get_param_by_name(effect, "image");
+
+	gs_effect_set_texture(image, texture);
+
 	rot = capture->rot;
 
 	while (gs_effect_loop(effect, "Draw")) {
+		gs_matrix_push();
+
 		if (rot != 0) {
 			float x = 0.0f;
 			float y = 0.0f;
 
 			switch (rot) {
 			case 90:
-				x = (float)capture->height;
+				x = (float)capture->capture.height;
 				break;
 			case 180:
-				x = (float)capture->width;
-				y = (float)capture->height;
+				x = (float)capture->capture.width;
+				y = (float)capture->capture.height;
 				break;
 			case 270:
-				y = (float)capture->width;
+				y = (float)capture->capture.width;
 				break;
 			}
 
-			gs_matrix_push();
 			gs_matrix_translate3f(x, y, 0.0f);
 			gs_matrix_rotaa4f(0.0f, 0.0f, 1.0f, RAD((float)rot));
 		}
 
-		obs_source_draw(texture, 0, 0, 0, 0, false);
-
-		if (rot != 0)
-			gs_matrix_pop();
+		gs_draw_sprite_subregion(texture, 0, capture->capture.x,
+					 capture->capture.y,
+					 capture->capture.width,
+					 capture->capture.height);
+		gs_matrix_pop();
 	}
 
 	if (capture->capture_cursor) {
@@ -297,6 +424,9 @@ static obs_properties_t *duplicator_capture_properties(void *unused)
 		OBS_COMBO_FORMAT_INT);
 
 	obs_properties_add_bool(props, "capture_cursor", TEXT_CAPTURE_CURSOR);
+
+	obs_properties_add_bool(props, "capture_foreground_window",
+				TEXT_CAPTURE_FOREGROUND_WINDOW);
 
 	obs_enter_graphics();
 
