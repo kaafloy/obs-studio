@@ -220,10 +220,10 @@ static void duplicator_capture_tick(void *data, float seconds)
 			ClientToScreen(hwnd, &topLeft);
 			ClientToScreen(hwnd, &bottomRight);
 
-			long x = topLeft.x;
-			long y = topLeft.y;
-			uint32_t width = bottomRight.x - topLeft.x;
-			uint32_t height = bottomRight.y - topLeft.y;
+			long x = topLeft.x - 1;
+			long y = topLeft.y - 1;
+			uint32_t width = bottomRight.x - topLeft.x + 1;
+			uint32_t height = bottomRight.y - topLeft.y + 1;
 
 			if (capture->target.x != x || capture->target.y != y ||
 			    capture->target.width != width ||
@@ -249,10 +249,12 @@ static void duplicator_capture_tick(void *data, float seconds)
 				capture->target.x, capture->capture.x, factor));
 			capture->capture.y = (long)round(lerp(
 				capture->target.y, capture->capture.y, factor));
-			capture->capture.width = (long)round(lerp(capture->target.width,
-					   capture->capture.width, factor));
-			capture->capture.height =(long)round(lerp(capture->target.height,
-					   capture->capture.height, factor));
+			capture->capture.width = (long)round(
+				lerp(capture->target.width,
+				     capture->capture.width, factor));
+			capture->capture.height = (long)round(
+				lerp(capture->target.height,
+				     capture->capture.height, factor));
 		}
 	}
 
